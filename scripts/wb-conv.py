@@ -29,6 +29,7 @@ from pathlib import Path
 import re
 import sqlite3
 import sys
+import tempfile
 from urllib.parse import quote
 
 DEFAULT_WB_HOME = os.path.join(os.path.expanduser("~"), ".workbuddy")
@@ -227,6 +228,28 @@ def _validate_attachment_dir(directory):
         sys.exit("图片附件目录已存在且不是目录")
 
 
+def _write_temp_file(directory, prefix, data):
+    """Write bytes under a unique sibling name, keeping partial files on failure."""
+    try:
+        fd, name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+    except OSError:
+        return None, None
+    try:
+        stream = os.fdopen(fd, "wb")
+        with stream as f:
+            written = f.write(data)
+            if written != len(data):
+                raise OSError("short write")
+            f.flush()
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None, Path(name)
+    return Path(name), None
+
+
 def _export_image(blob_path, mime, directory, cache):
     """Copy a referenced local image from within WB_HOME; return safe relative link or None."""
     if not isinstance(blob_path, str) or not blob_path.strip():
@@ -240,7 +263,8 @@ def _export_image(blob_path, mime, directory, cache):
     try:
         if not source.is_file():
             return None
-        suffix = IMAGE_MIME_SUFFIXES.get(mime) or source.suffix.lower()
+        mime_suffix = IMAGE_MIME_SUFFIXES.get(mime) if isinstance(mime, str) else None
+        suffix = mime_suffix or source.suffix.lower()
         if suffix not in IMAGE_SUFFIXES:
             return None
         data = source.read_bytes()
@@ -261,10 +285,27 @@ def _export_image(blob_path, mime, directory, cache):
         except OSError:
             return None
     else:
-        try:
-            target.write_bytes(data)
-        except OSError:
+        temporary, partial = _write_temp_file(directory, ".wb-image-", data)
+        if temporary is None:
             return None
+        try:
+            # Hard-link publication is atomic and fails instead of replacing a concurrent target
+            os.link(temporary, target)
+        except OSError:
+            try:
+                if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
+                    temporary.unlink()
+                    return None
+            except OSError:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+                return None
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
     cache[key] = name
     return name
 
@@ -332,6 +373,11 @@ def cmd_show(args):
     lines = []
     total = 0
     if args.out:
+        if os.path.lexists(args.out) and not os.path.isfile(args.out):
+            sys.exit("--out 必须指向普通文件，不能是目录或特殊文件")
+        out_parent = os.path.dirname(os.path.abspath(args.out)) or "."
+        if os.path.lexists(out_parent) and not os.path.isdir(out_parent):
+            sys.exit("--out 的父路径不是目录")
         out_path = os.path.normcase(os.path.realpath(os.path.abspath(args.out)))
         wb_root = os.path.normcase(os.path.realpath(os.path.abspath(WB_HOME)))
         source_path = os.path.normcase(os.path.realpath(os.path.abspath(path)))
@@ -350,6 +396,12 @@ def cmd_show(args):
                         sys.exit(message)
                 except OSError:
                     continue
+        if args.images:
+            _validate_attachment_dir(attachment_dir_for(args.out))
+        try:
+            os.makedirs(out_parent, exist_ok=True)
+        except OSError:
+            sys.exit("无法创建 --out 的父目录")
         if args.images:
             _validate_attachment_dir(attachment_dir_for(args.out))
     if args.raw:
@@ -373,6 +425,7 @@ def cmd_show(args):
         for blob_path, mime, unsupported_type in images if args.images else []:
             if unsupported_type:
                 lines.append(f"[图片未导出：不支持的图片类型 {unsupported_type}]")
+                print("未导出不支持的图片结构", file=sys.stderr)
                 continue
             if not attachment_created:
                 try:
@@ -397,9 +450,14 @@ def cmd_show(args):
     header = f"# 会话 {sid}\n源文件: {path}\n消息数: {total}\n"
     body = header + "\n".join(lines)
     if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as f:
-            f.write(body)
+        temporary, partial = _write_temp_file(
+            os.path.dirname(os.path.abspath(args.out)) or ".", ".wb-markdown-", body.encode("utf-8"))
+        if temporary is None:
+            sys.exit("Markdown 导出写入失败，部分临时文件保留用于诊断")
+        try:
+            os.replace(temporary, args.out)
+        except OSError:
+            sys.exit("Markdown 导出发布失败，临时文件保留用于诊断")
         print(f"已导出 {len(body)} 字符 → {args.out}（消息 {total} 条）")
     else:
         print(body)

@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -260,6 +261,119 @@ class ReaderRegression(unittest.TestCase):
         self.assertEqual(body.count('图片未导出'), 3)
         self.assertNotIn(str(missing), body)
         self.assertNotIn('private.png', body)
+        self.assertIn('未导出不支持的图片结构', p.stderr)
+
+    def test_images_invalid_mime_falls_back_to_safe_source_suffix(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'mime.png'
+        image.write_bytes(b'png-data')
+        dict_mime = self._image_block(image)
+        dict_mime['mime'] = {'unexpected': 'object'}
+        list_mime = self._image_block(image)
+        list_mime['mime'] = ['unexpected', 'list']
+        self._add_image_session([dict_mime, list_mime])
+        out = pathlib.Path(self.tmp.name) / 'mime.md'
+        p = self.run_cli('show', 'image1234', '--images', '--out', str(out), home=self.home)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(out.read_text(encoding='utf-8').count('![图片]('), 2)
+        attachments = list(out.with_name('mime-attachments').iterdir())
+        self.assertEqual(len(attachments), 1)
+        self.assertEqual(attachments[0].suffix, '.png')
+        self.assertEqual(attachments[0].read_bytes(), b'png-data')
+
+    def test_out_directory_is_rejected_before_attachment_write(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-data')
+        self._add_image_session([self._image_block(image)])
+        out_dir = pathlib.Path(self.tmp.name) / 'already-a-directory'
+        out_dir.mkdir()
+        p = self.run_cli('show', 'image1234', '--images', '--out', str(out_dir), home=self.home)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('--out 必须指向普通文件', p.stderr)
+        self.assertFalse(out_dir.with_name(out_dir.name + '-attachments').exists())
+        self.assertEqual(image.read_bytes(), b'png-data')
+
+    def test_partial_image_temp_is_not_published_and_retry_succeeds(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-complete')
+        spec = importlib.util.spec_from_file_location('wb_conv_partial_test_module', CLI)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.set_home(str(self.home))
+        destination = pathlib.Path(self.tmp.name) / 'atomic-attachments'
+        destination.mkdir()
+        real_fdopen = os.fdopen
+
+        class PartialWriter:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.stream.close()
+
+            def write(self, data):
+                self.stream.write(data[:4])
+                self.stream.flush()
+                raise OSError('synthetic interrupted write')
+
+            def flush(self):
+                self.stream.flush()
+
+        with mock.patch.object(module.os, 'fdopen', side_effect=lambda fd, mode: PartialWriter(real_fdopen(fd, mode))):
+            self.assertIsNone(module._export_image(str(image), 'image/png', destination, {}))
+        partials = list(destination.glob('.wb-image-*.tmp'))
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(partials[0].read_bytes(), b'png-')
+        target_name = hashlib.sha256(image.read_bytes()).hexdigest() + '.png'
+        self.assertFalse((destination / target_name).exists())
+        name = module._export_image(str(image), 'image/png', destination, {})
+        self.assertEqual(name, target_name)
+        self.assertEqual((destination / name).read_bytes(), image.read_bytes())
+
+    def test_concurrent_different_target_is_never_overwritten(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-source')
+        spec = importlib.util.spec_from_file_location('wb_conv_race_test_module', CLI)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.set_home(str(self.home))
+        destination = pathlib.Path(self.tmp.name) / 'race-attachments'
+        destination.mkdir()
+        target = destination / (hashlib.sha256(image.read_bytes()).hexdigest() + '.png')
+
+        def concurrent_publish(_temporary, target_path):
+            pathlib.Path(target_path).write_bytes(b'user-existing-data')
+            raise FileExistsError('synthetic concurrent publication')
+
+        with mock.patch.object(module.os, 'link', side_effect=concurrent_publish):
+            self.assertIsNone(module._export_image(str(image), 'image/png', destination, {}))
+        self.assertEqual(target.read_bytes(), b'user-existing-data')
+
+    def test_markdown_replace_failure_preserves_existing_output(self):
+        self._add_image_session([{'type': 'input_text', 'text': 'atomic markdown'}])
+        spec = importlib.util.spec_from_file_location('wb_conv_markdown_test_module', CLI)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.set_home(str(self.home))
+        out = pathlib.Path(self.tmp.name) / 'keep.md'
+        out.write_text('previous complete export', encoding='utf-8')
+        args = argparse.Namespace(id='image1234', images=False, out=str(out), raw=False,
+                                  full=False, maxlen=1500, trace=False)
+        with mock.patch.object(module.os, 'replace', side_effect=OSError('synthetic publish failure')):
+            with self.assertRaises(SystemExit):
+                module.cmd_show(args)
+        self.assertEqual(out.read_text(encoding='utf-8'), 'previous complete export')
+        self.assertTrue(list(pathlib.Path(self.tmp.name).glob('.wb-markdown-*.tmp')))
 
     def test_images_requires_out_before_any_write(self):
         self._add_image_session([{'type': 'input_text', 'text': 'x'}])
