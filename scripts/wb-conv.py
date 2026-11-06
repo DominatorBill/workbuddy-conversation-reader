@@ -22,12 +22,14 @@
 import argparse
 import datetime as dt
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import sqlite3
 import sys
+from urllib.parse import quote
 
 DEFAULT_WB_HOME = os.path.join(os.path.expanduser("~"), ".workbuddy")
 WB_HOME = None
@@ -56,6 +58,9 @@ USER_QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.S | re.I)
 ASSISTANT_TAIL_RE = re.compile(r"<assistant_tail>(.*?)</assistant_tail>", re.S | re.I)
 
 TEXT_PART_TYPES = {"input_text", "output_text", "text"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+IMAGE_MIME_SUFFIXES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+                       "image/webp": ".webp", "image/bmp": ".bmp"}
 
 
 def ts(ms):
@@ -152,13 +157,8 @@ def strip_injected_tags(t):
     return TAIL_TAG_RE.sub("", t)
 
 
-def iter_messages(path, prefilter=None, raw=False):
-    """产出 (role, text, timestamp)，只取对话正文。
-
-    prefilter 给了关键词时，先做原始行字符串预筛再 json.loads ——
-    先按原始行筛选关键词，再解析可能命中的 JSON 行。
-    中文若被写成 \\uXXXX 转义（ensure_ascii），明文匹配会漏，所以两种形式都试。
-    """
+def iter_message_records(path, prefilter=None, raw=False):
+    """产出消息文本及结构化图片引用；JSONL仍只解析一次。"""
     esc = json.dumps(prefilter, ensure_ascii=True)[1:-1] if prefilter else None
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -171,25 +171,102 @@ def iter_messages(path, prefilter=None, raw=False):
                 d = json.loads(line)
             except Exception:
                 continue
-            if d.get("type") != "message":
+            if not isinstance(d, dict) or d.get("type") != "message":
                 continue
             role = d.get("role") or "?"
             parts = d.get("content") or []
             buf = []
+            images = []
             if isinstance(parts, str):
                 buf.append(parts)
-            else:
+            elif isinstance(parts, list):
                 for c in parts:
                     if isinstance(c, dict) and c.get("type") in TEXT_PART_TYPES:
                         buf.append(c.get("text") or "")
-            text = "\n".join(x for x in buf if x).strip()
-            if not text:
-                continue
-            if role == "user":
+                    elif isinstance(c, dict) and c.get("type") == "image_blob_ref":
+                        images.append((c.get("blob_path"), c.get("mime"), None))
+                    elif isinstance(c, dict) and c.get("type") in {"input_image", "image_gen_tool_result"}:
+                        images.append((None, None, c.get("type")))
+            text = "\n".join(x for x in buf if isinstance(x, str) and x).strip()
+            if role == "user" and text:
                 text = text if raw else clean_user_text(text)
-                if not text:
-                    continue
-            yield role, text, d.get("timestamp")
+            if text or images:
+                yield role, text, d.get("timestamp"), images
+
+
+def iter_messages(path, prefilter=None, raw=False):
+    """产出 (role, text, timestamp)，兼容既有检索调用方。
+
+    prefilter 给了关键词时，先做原始行字符串预筛再 json.loads ——
+    先按原始行筛选关键词，再解析可能命中的 JSON 行。
+    中文若被写成 \\uXXXX 转义（ensure_ascii），明文匹配会漏，所以两种形式都试。
+    """
+    for role, text, timestamp, _ in iter_message_records(path, prefilter=prefilter, raw=raw):
+        if text:
+            yield role, text, timestamp
+
+
+def attachment_dir_for(out_path):
+    out = Path(out_path)
+    return out.parent / (out.stem + "-attachments")
+
+
+def _inside(path, root):
+    try:
+        return os.path.commonpath([os.path.normcase(os.path.realpath(path)),
+                                   os.path.normcase(os.path.realpath(root))]) == os.path.normcase(os.path.realpath(root))
+    except ValueError:
+        return False
+
+
+def _validate_attachment_dir(directory):
+    """Reject attachment outputs resolving into WorkBuddy storage before any writes."""
+    if _inside(directory, WB_HOME):
+        sys.exit("拒绝将图片附件写入 WorkBuddy 数据目录")
+    if os.path.lexists(directory) and not os.path.isdir(directory):
+        sys.exit("图片附件目录已存在且不是目录")
+
+
+def _export_image(blob_path, mime, directory, cache):
+    """Copy a referenced local image from within WB_HOME; return safe relative link or None."""
+    if not isinstance(blob_path, str) or not blob_path.strip():
+        return None
+    source = Path(os.path.expanduser(os.path.expandvars(blob_path)))
+    if not source.is_absolute():
+        source = Path(WB_HOME) / source
+    source = Path(os.path.abspath(source))
+    if not _inside(source, WB_HOME):
+        return None
+    try:
+        if not source.is_file():
+            return None
+        suffix = IMAGE_MIME_SUFFIXES.get(mime) or source.suffix.lower()
+        if suffix not in IMAGE_SUFFIXES:
+            return None
+        data = source.read_bytes()
+        if not data:
+            return None
+    except OSError:
+        return None
+    digest = hashlib.sha256(data).hexdigest()
+    key = (digest, suffix)
+    if key in cache:
+        return cache[key]
+    name = f"{digest}{suffix}"
+    target = Path(directory) / name
+    if os.path.lexists(target):
+        try:
+            if target.is_symlink() or not target.is_file() or target.read_bytes() != data:
+                return None
+        except OSError:
+            return None
+    else:
+        try:
+            target.write_bytes(data)
+        except OSError:
+            return None
+    cache[key] = name
+    return name
 
 
 def iter_trace(path):
@@ -249,6 +326,8 @@ def cmd_list(args):
 
 
 def cmd_show(args):
+    if args.images and not args.out:
+        sys.exit("--images 必须与 --out 一起使用")
     sid, path = resolve_prefix(args.id)
     lines = []
     total = 0
@@ -271,15 +350,45 @@ def cmd_show(args):
                         sys.exit(message)
                 except OSError:
                     continue
+        if args.images:
+            _validate_attachment_dir(attachment_dir_for(args.out))
     if args.raw:
         args.full = True
-    for role, text, t in iter_messages(path, raw=args.raw):
+    image_cache = {}
+    attachment_dir = attachment_dir_for(args.out) if args.images else None
+    attachment_created = False
+    records = (iter_message_records(path, raw=args.raw) if args.images else
+               ((role, text, timestamp, [])
+                for role, text, timestamp in iter_messages(path, raw=args.raw)))
+    for role, text, t, images in records:
+        if not text and not images:
+            continue
         total += 1
         label = "用户" if role == "user" else ("助手" if role == "assistant" else role)
         lines.append(f"\n### [{label}] {ts(t)}")
-        lines.append(text if args.full else text[: args.maxlen])
+        if text:
+            lines.append(text if args.full else text[: args.maxlen])
         if not args.full and len(text) > args.maxlen:
             lines.append(f"...(截断，原文 {len(text)} 字，用 --full 看全)")
+        for blob_path, mime, unsupported_type in images if args.images else []:
+            if unsupported_type:
+                lines.append(f"[图片未导出：不支持的图片类型 {unsupported_type}]")
+                continue
+            if not attachment_created:
+                try:
+                    os.makedirs(attachment_dir, exist_ok=True)
+                    _validate_attachment_dir(attachment_dir)
+                    attachment_created = True
+                except OSError:
+                    pass
+            name = _export_image(blob_path, mime, attachment_dir, image_cache) if attachment_created else None
+            if name:
+                relative = Path(Path(args.out).stem + "-attachments") / name
+                link = quote(relative.as_posix(), safe="/-._~")
+                lines.append(f"![图片]({link})")
+            else:
+                lines.append("[图片未导出：本地图片引用缺失、不可读或格式不支持]")
+                print("图片引用未导出（引用缺失、不可读或格式不支持）", file=sys.stderr)
     if args.trace:
         lines.append("\n## 工具调用轨迹")
         for x in iter_trace(path):
@@ -455,6 +564,7 @@ def main():
     p.add_argument("--trace", action="store_true", help="附工具调用轨迹")
     p.add_argument("--raw", action="store_true", help="保留用户消息包装原文（自动完整输出）")
     p.add_argument("--out", help="写入文件")
+    p.add_argument("--images", action="store_true", help="复制消息中的本地图片引用到导出附件目录")
     p.set_defaults(func=cmd_show)
 
     p = sub.add_parser("title", help="查看会话元信息")

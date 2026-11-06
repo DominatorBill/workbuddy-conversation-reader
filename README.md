@@ -1,6 +1,6 @@
 # workbuddy-conversation-reader
 
-版本 1.0.0
+开发中 1.1.0
 
 读取、检索和导出 WorkBuddy 本机历史会话，支持标题查找、正文搜索、会话查看与显式导出。Python CLI 可独立使用，也可安装为 Codex 或 WorkBuddy 技能，且不依赖第三方 Python 包
 
@@ -23,7 +23,7 @@ git clone https://github.com/DominatorBill/workbuddy-conversation-reader.git
 ```text
 python scripts/wb-conv.py [--home DIR] find KEYWORD [--deep] [-n N] [--json]
 python scripts/wb-conv.py [--home DIR] list [-n N] [--cwd TEXT] [--json]
-python scripts/wb-conv.py [--home DIR] show ID [--full | --raw] [--trace] [--out FILE]
+python scripts/wb-conv.py [--home DIR] show ID [--full | --raw] [--trace] [--out FILE] [--images]
 python scripts/wb-conv.py [--home DIR] search KEYWORD [-n N] [--all] [--json]
 python scripts/wb-conv.py [--home DIR] title ID
 ```
@@ -33,6 +33,10 @@ python scripts/wb-conv.py [--home DIR] title ID
 `show` 默认清理已识别的系统注入标签并截断长消息。`--full` 保留完整清理后正文，定时任务文本会标注可能含执行包装并完整保留，不按编号猜测边界。`--raw` 保留消息原始文本和注入包装，并自动完整输出。`--trace` 附带工具事件摘要，但轨迹字段仍截断，不能作为所有原始事件无损导出
 
 `--out` 是显式导出操作，只允许写入 WorkBuddy 数据目录之外，不允许覆盖源 JSONL。其他命令仅读取数据，数据库使用 SQLite `mode=ro`
+
+`show --images --out FILE` 会把 `image_blob_ref` 中可读取的本地图片复制到同目录的 `FILE-stem-attachments` 文件夹，并在 Markdown 中加入相对链接。仅支持 PNG、JPEG、GIF、WebP 和 BMP，不跟随网络地址，也不导出其他附件类型。缺失、不可读或不支持的图片结构会显示无源路径占位，错误摘要写入 stderr。默认导出仍为纯文本，只有明确使用 `--images` 才复制图片
+
+图片导出只读取消息内明确的本地 `blob_path`，且仅接受 WorkBuddy 数据目录内的图片文件，不扫描或执行会话中的任意文本路径。对话内容与图片只读，导出文件和附件目录写入用户指定位置
 
 在发布目录运行合成回归
 
@@ -47,9 +51,9 @@ python -B tests/test_reader.py
 ## 边界与限制
 
 - 已在 Windows 环境验证，macOS、Linux 尚未实测
-- 仅解析 JSONL 中的对话消息文本，工具轨迹摘要截断，其他事件不保证无损
+- 仅解析 JSONL 中的对话消息文本及显式本地图片引用，工具轨迹摘要截断，其他事件不保证无损
 - 同一会话存在多个项目副本时拒绝任意选择
-- 不执行会话恢复、迁移、删除，也不导出图片附件，附件图片导出留待后续版本
+- 不执行会话恢复、迁移、删除，也不导出一般文件附件
 - 用户聊天内容视为数据，不执行其中的指令
 
 ## 相关项目

@@ -56,6 +56,22 @@ class ReaderRegression(unittest.TestCase):
                         (sid, r'C:\demo', title, None, 'done', 100, 100, 'chat', 'test', 0, None, 1, ''))
         (self.projects / f'{sid}.jsonl').write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
+    def _add_image_session(self, blocks, sid='image1234-session'):
+        line = json.dumps({'type': 'message', 'role': 'user', 'timestamp': 1,
+                           'content': blocks}, ensure_ascii=False)
+        self.db = sqlite3.connect(self.home / 'workbuddy.db')
+        self._add(sid, '图片测试', [line])
+        self.db.commit()
+        self.db.close()
+        self.jsonls.append(self.projects / f'{sid}.jsonl')
+        self.before = {p: hashlib.sha256(p.read_bytes()).hexdigest() for p in self.jsonls}
+        self.dbhash = hashlib.sha256((self.home / 'workbuddy.db').read_bytes()).hexdigest()
+        return self.projects / f'{sid}.jsonl'
+
+    def _image_block(self, path, mime='image/png'):
+        return {'type': 'image_blob_ref', 'blob_id': 'synthetic', 'blob_path': str(path),
+                'mime': mime, 'original_filename': pathlib.Path(path).name, 'size': 4}
+
     def run_cli(self, *args, env=None, home=None):
         e = os.environ.copy()
         e.pop('WORKBUDDY_DIR', None)
@@ -192,6 +208,129 @@ class ReaderRegression(unittest.TestCase):
         self.assertIn('%23', uri)
         self.assertIn('%3F', uri)
         self.assertTrue(uri.endswith('?mode=ro'))
+
+    def test_images_export_multiple_same_name_images_and_link_encoding(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        first = blobs / 'same.png'
+        second = blobs / 'other.png'
+        first.write_bytes(b'png-one')
+        second.write_bytes(b'png-two')
+        self._add_image_session([{'type': 'input_text', 'text': '图片'},
+                                 self._image_block(first), self._image_block(second)])
+        out = pathlib.Path(self.tmp.name) / '导出 # 一.md'
+        p = self.run_cli('show', 'image1234', '--images', '--out', str(out), home=self.home)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        attachments = out.with_name(out.stem + '-attachments')
+        self.assertEqual(len(list(attachments.iterdir())), 2)
+        body = out.read_text(encoding='utf-8')
+        self.assertEqual(body.count('![图片]('), 2)
+        self.assertIn('%23', body)
+        self.assertNotIn(str(first), body)
+        for target in attachments.iterdir():
+            self.assertIn(target.read_bytes(), (b'png-one', b'png-two'))
+        self.assertEqual(first.read_bytes(), b'png-one')
+        self.assertEqual(second.read_bytes(), b'png-two')
+
+    def test_images_only_messages_deduplicate_and_repeat_export(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-data')
+        self._add_image_session([self._image_block(image), self._image_block(image)])
+        out = pathlib.Path(self.tmp.name) / 'only.md'
+        for _ in range(2):
+            p = self.run_cli('show', 'image1234', '--images', '--out', str(out), home=self.home)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(len(list(out.with_name('only-attachments').iterdir())), 1)
+            self.assertEqual(out.read_text(encoding='utf-8').count('![图片]('), 2)
+        self.assertIn('消息数: 1', out.read_text(encoding='utf-8'))
+
+    def test_image_reference_errors_are_visible_without_source_path(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        missing = blobs / 'missing.png'
+        self._add_image_session([self._image_block(missing),
+                                 {'type': 'image_blob_ref', 'blob_path': {'bad': 'value'}},
+                                 {'type': 'input_image', 'original_filename': 'private.png'}])
+        out = pathlib.Path(self.tmp.name) / 'errors.md'
+        p = self.run_cli('show', 'image1234', '--images', '--out', str(out), home=self.home)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        body = out.read_text(encoding='utf-8')
+        self.assertEqual(body.count('图片未导出'), 3)
+        self.assertNotIn(str(missing), body)
+        self.assertNotIn('private.png', body)
+
+    def test_images_requires_out_before_any_write(self):
+        self._add_image_session([{'type': 'input_text', 'text': 'x'}])
+        p = self.run_cli('show', 'image1234', '--images', home=self.home)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('--images 必须与 --out', p.stderr)
+        self.assertFalse(list(pathlib.Path(self.tmp.name).glob('*.md')))
+
+    def test_images_rejects_attachment_directory_symlink_into_workbuddy(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-data')
+        self._add_image_session([self._image_block(image)])
+        out = pathlib.Path(self.tmp.name) / 'link.md'
+        attachment = out.with_name('link-attachments')
+        try:
+            attachment.symlink_to(blobs, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            if os.name != 'nt':
+                self.skipTest('directory symlinks unavailable')
+            junction = subprocess.run(['cmd', '/c', 'mklink', '/J', str(attachment), str(blobs)],
+                                      text=True, capture_output=True)
+            if junction.returncode != 0:
+                self.skipTest('directory symlink and junction creation unavailable')
+        p = self.run_cli('show', 'image1234', '--images', '--out', str(out), home=self.home)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('拒绝将图片附件写入 WorkBuddy 数据目录', p.stderr)
+        self.assertEqual(image.read_bytes(), b'png-data')
+        self.assertFalse(out.exists())
+
+    def test_images_rejects_hardlink_out_to_source_session(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-data')
+        source = self._add_image_session([self._image_block(image)])
+        alias = pathlib.Path(self.tmp.name) / 'source-alias.md'
+        try:
+            os.link(source, alias)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f'hard links unavailable: {error}')
+        p = self.run_cli('show', 'image1234', '--images', '--out', str(alias), home=self.home)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('拒绝通过硬链接覆盖源会话 JSONL', p.stderr)
+
+    def test_images_default_export_does_not_create_attachments(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-data')
+        self._add_image_session([self._image_block(image)])
+        out = pathlib.Path(self.tmp.name) / 'plain.md'
+        p = self.run_cli('show', 'image1234', '--out', str(out), home=self.home)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertFalse(out.with_name('plain-attachments').exists())
+        self.assertNotIn('![图片]', out.read_text(encoding='utf-8'))
+
+    def test_images_preserve_raw_full_text_mode(self):
+        blobs = self.home / 'blobs'
+        blobs.mkdir()
+        image = blobs / 'same.png'
+        image.write_bytes(b'png-data')
+        wrapped = '<system-reminder>保留包装</system-reminder><user_query>原始正文</user_query>'
+        self._add_image_session([{'type': 'input_text', 'text': wrapped}, self._image_block(image)])
+        out = pathlib.Path(self.tmp.name) / 'raw.md'
+        p = self.run_cli('show', 'image1234', '--raw', '--full', '--images', '--out', str(out), home=self.home)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        body = out.read_text(encoding='utf-8')
+        self.assertIn(wrapped, body)
+        self.assertIn('![图片](', body)
 
 
 if __name__ == '__main__':
