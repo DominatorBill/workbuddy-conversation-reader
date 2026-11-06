@@ -21,16 +21,22 @@
 """
 import argparse
 import datetime as dt
+from collections import deque
 import glob
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sqlite3
 import sys
 import tempfile
+import time
 from urllib.parse import quote
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from wb_catalog import load_catalog
 
 DEFAULT_WB_HOME = os.path.join(os.path.expanduser("~"), ".workbuddy")
 WB_HOME = None
@@ -49,6 +55,34 @@ def set_home(cli_home=None):
 
 def jsonl_paths(sid):
     return sorted(glob.glob(os.path.join(PROJECTS_DIR, "*", f"{sid}.jsonl")))
+
+
+def catalog():
+    return load_catalog(WB_HOME)
+
+
+def catalog_rows(include_deleted=True):
+    return [s for s in catalog()["sessions"] if include_deleted or not s["deleted"]]
+
+
+def pick_session(prefix, require_path=True):
+    rows = [s for s in catalog_rows() if s["id"].startswith(prefix)]
+    if not rows:
+        sys.exit(f"没有匹配 {prefix!r} 的会话")
+    exact = [s for s in rows if s["id"] == prefix]
+    if exact:
+        rows = exact
+    if len(rows) > 1:
+        print("前缀有歧义，命中多个，请给更长的前缀：", file=sys.stderr)
+        for row in rows[:20]:
+            print(f"  {row['id']}", file=sys.stderr)
+        sys.exit(2)
+    row = rows[0]
+    if len(row["paths"]) > 1:
+        sys.exit(f"会话 {row['id']} 存在多个项目副本（JSONL），无法安全选择: " + ", ".join(row["paths"]))
+    if require_path and not row["paths"]:
+        sys.exit(f"会话 {row['id']} 正文文件缺失")
+    return row
 
 SYS_BLOCK_RE = re.compile(r"<system-reminder\b.*?</system-reminder>", re.S | re.I)
 ANY_TAG_BLOCK_RE = re.compile(r"<(identity_context|project_context|project_guidance|"
@@ -89,23 +123,8 @@ def session_jsonl(sid):
 
 def resolve_prefix(prefix):
     """支持 id 前缀；返回 (完整 id, jsonl 路径)。"""
-    found = {}
-    for p in glob.glob(os.path.join(PROJECTS_DIR, "*", f"{prefix}*.jsonl")):
-        found.setdefault(os.path.basename(p)[:-6], []).append(p)
-    rows = [(sid, paths[0]) for sid, paths in found.items()]
-    if not rows:
-        sys.exit(f"没有匹配 {prefix!r} 的会话文件")
-    if len(rows) > 1:
-        exact = [r for r in rows if r[0] == prefix]
-        if exact and len(found[prefix]) == 1:
-            return exact[0]
-        print("前缀有歧义，命中多个，请给更长的前缀：", file=sys.stderr)
-        for sid, _ in rows[:20]:
-            print(f"  {sid}", file=sys.stderr)
-        sys.exit(2)
-    if len(found[rows[0][0]]) > 1:
-        sys.exit(f"会话 {rows[0][0]} 存在多个项目副本，无法安全选择: " + ", ".join(found[rows[0][0]]))
-    return rows[0]
+    row = pick_session(prefix)
+    return row["id"], row["paths"][0]
 
 
 AUTOMATION_WRAPPER_MARK = "You MUST follow these steps in order"
@@ -331,27 +350,22 @@ def iter_trace(path):
 
 
 def cmd_list(args):
-    con = open_db()
-    cur = con.cursor()
-    sql = ("select id, cwd, title, custom_title, status, updated_at, mode, model, "
-           "is_background_automation from sessions where deleted_at is null")
-    params = []
-    if args.cwd:
-        sql += " and cwd like ?"
-        params.append(f"%{args.cwd}%")
-    sql += " order by coalesce(last_activity_at, updated_at) desc limit ?"
-    params.append(args.n)
-    rows = cur.execute(sql, params).fetchall()
-
+    data = catalog()
+    if data["index"]["status"] != "ok":
+        print(f"警告：会话索引{data['index']['status']}（{data['index']['detail']}），按 JSONL 文件列出可发现会话", file=sys.stderr)
+    rows = [s for s in data["sessions"] if not s["deleted"]]
+    rows = [s for s in rows if not args.cwd or (s["cwd"] and args.cwd.casefold() in s["cwd"].casefold())]
+    rows.sort(key=lambda s: (s["updated_ms"] is not None, s["updated_ms"] or 0, s["id"]), reverse=True)
+    rows = rows[:args.n]
     out = []
-    for sid, cwd, title, custom, status, upd, mode, model, bg in rows:
-        p = session_jsonl(sid)
+    for s in rows:
+        p = s["paths"][0] if len(s["paths"]) == 1 else None
         out.append({
-            "id": sid, "short": sid[:8], "cwd": cwd,
-            "title": custom or title or "(无标题)",
-            "status": status, "updated": ts(upd),
-            "updated_ms": upd, "mode": mode, "model": model,
-            "automation": bool(bg),
+            "id": s["id"], "short": s["id"][:8], "cwd": s["cwd"],
+            "title": s["title"] or ("(未索引)" if not s["indexed"] else "(无标题)"),
+            "status": s["status"], "updated": ts(s["updated_at"]),
+            "updated_ms": s["updated_at"], "mode": s["mode"], "model": s["model"],
+            "automation": s["automation"],
             "size_mb": round(os.path.getsize(p) / 1048576, 2) if p else None,
         })
 
@@ -412,6 +426,11 @@ def cmd_show(args):
     records = (iter_message_records(path, raw=args.raw) if args.images else
                ((role, text, timestamp, [])
                 for role, text, timestamp in iter_messages(path, raw=args.raw)))
+    tail = getattr(args, "tail", None)
+    if tail is not None:
+        if tail < 1:
+            sys.exit("--tail 必须是正整数")
+        records = deque(records, maxlen=tail)
     for role, text, t, images in records:
         if not text and not images:
             continue
@@ -464,17 +483,64 @@ def cmd_show(args):
 
 
 def cmd_title(args):
-    sid, path = resolve_prefix(args.id)
-    con = open_db()
-    row = con.execute(
-        "select id,cwd,title,custom_title,status,created_at,updated_at,mode,model,permission_mode "
-        "from sessions where id=?", (sid,)).fetchone()
-    keys = ["id", "cwd", "title", "custom_title", "status", "created_at", "updated_at",
-            "mode", "model", "permission_mode"]
-    d = dict(zip(keys, row)) if row else {}
-    d["jsonl"] = path
-    d["size_bytes"] = os.path.getsize(path)
+    row = pick_session(args.id, require_path=False)
+    d = {"id": row["id"], "cwd": row["cwd"], "title": row["raw_title"],
+         "custom_title": row["custom_title"], "status": row["status"],
+         "created_at": row["created_at"], "updated_at": row["updated_at"],
+         "updated_ms": row["updated_ms"], "mode": row["mode"], "model": row["model"],
+         "permission_mode": row["permission_mode"], "automation": row["automation"],
+         "indexed": row["indexed"]}
+    d["jsonl"] = row["paths"][0] if len(row["paths"]) == 1 else None
+    d["jsonl_paths"] = row["paths"]
+    d["size_bytes"] = os.path.getsize(d["jsonl"]) if d["jsonl"] else None
+    d["display_title"] = row["title"] or ("(未索引)" if not row["indexed"] else "(无标题)")
     print(json.dumps(d, ensure_ascii=False, indent=1))
+
+
+def cmd_locate(args):
+    rows = [s for s in catalog_rows() if s["id"].startswith(args.id)]
+    exact = [s for s in rows if s["id"] == args.id]
+    if exact:
+        rows = exact
+    if len(rows) > 1:
+        if args.json:
+            print(json.dumps({"matches": [{"id": s["id"], "paths": s["paths"], "indexed": s["indexed"]} for s in rows]}, ensure_ascii=False, indent=1))
+        else:
+            print("前缀有歧义：")
+            for s in rows:
+                print(f"{s['id']} indexed={str(s['indexed']).lower()} paths={', '.join(s['paths']) or '(正文缺失)'}")
+        return 2
+    if not rows:
+        sys.exit(f"没有匹配 {args.id!r} 的会话")
+    s = rows[0]
+    result = {"id": s["id"], "paths": s["paths"], "indexed": s["indexed"], "body_missing": not bool(s["paths"])}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=1))
+    else:
+        print(f"{s['id']} indexed={str(s['indexed']).lower()} body_missing={str(result['body_missing']).lower()}")
+        for path in s["paths"]:
+            print(path)
+    return 0
+
+
+def cmd_doctor(args):
+    data = catalog()
+    sessions = data["sessions"]
+    indexed = [s for s in sessions if s["indexed"]]
+    physical = [s for s in sessions if s["paths"]]
+    out = {"index": data["index"], "indexed_count": len(indexed),
+           "jsonl_session_count": len(physical), "jsonl_file_count": sum(len(s["paths"]) for s in sessions),
+           "orphan_count": sum(bool(s["paths"]) and not s["indexed"] for s in sessions),
+           "missing_count": sum(s["indexed"] and not s["paths"] for s in sessions),
+           "duplicate_count": sum(len(s["paths"]) > 1 for s in sessions),
+           "issues": [{"id": s["id"], "paths": s["paths"], "indexed": s["indexed"]}
+                      for s in sessions if not s["indexed"] or not s["paths"] or len(s["paths"]) > 1]}
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False, indent=1))
+    else:
+        for k, v in out.items():
+            print(f"{k}: {json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v}")
+    return 0
 
 
 def iter_all_text(path):
@@ -485,11 +551,13 @@ def iter_all_text(path):
                 d = json.loads(line)
             except Exception:
                 continue
+            role = d.get("role") if isinstance(d, dict) and isinstance(d.get("role"), str) else None
+            timestamp = d.get("timestamp") if isinstance(d, dict) else None
             stack = [d]
             while stack:
                 x = stack.pop()
                 if isinstance(x, str):
-                    yield "$all", x, None
+                    yield role, x, timestamp
                 elif isinstance(x, dict):
                     stack.extend(x.values())
                 elif isinstance(x, list):
@@ -499,24 +567,53 @@ def iter_all_text(path):
 def cmd_search(args):
     kw = args.keyword
     hits = []
-    for path in glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl")):
-        sid = os.path.basename(path)[:-6]
+    sessions = catalog()["sessions"]
+    since = args.since
+    before = args.before
+    for meta in sessions:
+        sid = meta["id"]
+        paths = meta["paths"]
+        if args.cwd and (not meta.get("cwd") or args.cwd.casefold() not in meta["cwd"].casefold()):
+            continue
         n = 0
         samples = []
-        source = iter_all_text(path) if args.all else iter_messages(path, prefilter=kw)
-        for role, text, t in source:
-            if kw not in text:
+        last_ms = None
+        size_bytes = 0
+        for path in paths:
+            try:
+                size_bytes += os.path.getsize(path)
+            except OSError:
                 continue
-            n += 1
-            if len(samples) < 2:
-                i = text.find(kw)
-                seg = text[max(0, i - 60): i + 100].replace("\n", " ")
-                samples.append(f"    [{role} {ts(t)}] …{seg}…")
+            source = iter_all_text(path) if args.all else iter_messages(path, prefilter=kw)
+            for role, text, t in source:
+                stamp = timestamp_ms(t)
+                if args.role and role != args.role:
+                    continue
+                if (since is not None or before is not None) and stamp is None:
+                    continue
+                if since is not None and stamp < since:
+                    continue
+                if before is not None and stamp >= before:
+                    continue
+                if kw not in text:
+                    continue
+                n += 1
+                if stamp is not None and (last_ms is None or stamp > last_ms):
+                    last_ms = stamp
+                if len(samples) < 2:
+                    i = text.find(kw)
+                    seg = text[max(0, i - 60): i + 100].replace("\n", " ")
+                    samples.append(f"    [{role} {ts(t)}] …{seg}…")
         if n:
             hits.append({"id": sid, "short": sid[:8], "count": n,
-                         "size_mb": round(os.path.getsize(path) / 1048576, 2),
-                         "samples": samples})
-    hits.sort(key=lambda x: -x["count"])
+                         "size_mb": round(size_bytes / 1048576, 2),
+                         "samples": samples, "title": meta.get("title"),
+                         "cwd": meta.get("cwd"), "last_match_ms": last_ms,
+                         "paths": paths, "ambiguous": len(paths) > 1})
+    if args.sort == "recent":
+        hits.sort(key=lambda x: (x["last_match_ms"] is not None, x["last_match_ms"] or 0, x["id"]), reverse=True)
+    else:
+        hits.sort(key=lambda x: (-x["count"], x["id"]))
     hits = hits[: args.n]
     if args.json:
         print(json.dumps(hits, ensure_ascii=False, indent=1))
@@ -524,7 +621,8 @@ def cmd_search(args):
     if not hits:
         print(f"没有会话命中 {kw!r}")
         return
-    print(f"命中 {len(hits)} 个会话（按命中数排序）\n")
+    sort_label = "按最近命中时间排序" if args.sort == "recent" else "按命中数排序"
+    print(f"命中 {len(hits)} 个会话（{sort_label}）\n")
     for h in hits:
         print(f"[{h['short']}] {h['count']} 处 · {h['size_mb']}MB · {h['id']}")
         for s in h["samples"]:
@@ -535,36 +633,34 @@ def cmd_search(args):
 def cmd_find(args):
     """按索引查标题，只有无标题命中且传 --deep 时才读取 JSONL 正文。"""
     kw = args.keyword
-    like = f"%{kw}%"
-    con = open_db()
-    rows = con.execute(
-        "select id, cwd, title, custom_title, status, updated_at, is_background_automation "
-        "from sessions where deleted_at is null and (title like ? or custom_title like ?) "
-        "order by coalesce(last_activity_at, updated_at) desc",
-        (like, like)).fetchall()
+    data = catalog()
+    if data["index"]["status"] != "ok":
+        print(f"警告：会话索引{data['index']['status']}（{data['index']['detail']}），标题未索引项无法匹配", file=sys.stderr)
+    sessions = [s for s in data["sessions"] if not s["deleted"]]
+    rows = [s for s in sessions if s["indexed"] and kw.casefold() in (s["title"] or "").casefold()]
+    rows.sort(key=lambda s: (s["updated_ms"] is not None, s["updated_ms"] or 0, s["id"]), reverse=True)
 
-    def hit(r):
-        sid, cwd, title, custom, status, upd, bg = r
-        p = session_jsonl(sid)
+    def hit(s):
+        sid = s["id"]
+        p = s["paths"][0] if len(s["paths"]) == 1 else None
         return {
-            "id": sid, "short": sid[:8], "cwd": cwd,
-            "title": custom or title or "(无标题)",
-            "status": status, "updated": ts(upd),
-            "automation": bool(bg),
+            "id": sid, "short": sid[:8], "cwd": s["cwd"],
+            "title": s["title"] or "(无标题)",
+            "status": s["status"], "updated": ts(s["updated_ms"]),
+            "automation": s["automation"],
             "size_mb": round(os.path.getsize(p) / 1048576, 2) if p else None,
         }
 
     out = []
     if not rows and args.deep:
-        paths = glob.glob(os.path.join(PROJECTS_DIR, "*", "*.jsonl"))
-        for path in paths:
-            sid = os.path.basename(path)[:-6]
-            if any(kw in text for _, text, _ in iter_messages(path, prefilter=kw)):
-                row = con.execute("select id,cwd,title,custom_title,status,updated_at,is_background_automation from sessions where id=? and deleted_at is null", (sid,)).fetchone()
-                if row:
-                    out.append(hit(row))
-                else:
-                    out.append({"id": sid, "short": sid[:8], "cwd": None, "title": "(索引不可用)", "status": None, "updated": "-", "automation": False, "size_mb": round(os.path.getsize(path)/1048576, 2), "match": "body"})
+        for s in sessions:
+            if any(any(kw in text for _, text, _ in iter_messages(path, prefilter=kw)) for path in s["paths"]):
+                item = hit(s)
+                if not s["indexed"]:
+                    item.update(cwd=None, title="(未索引)", status=None, updated="-", automation=False)
+                item["size_mb"] = round(sum(os.path.getsize(p) for p in s["paths"]) / 1048576, 2) if s["paths"] else None
+                item["match"] = "body"
+                out.append(item)
     elif rows:
         out = [hit(r) for r in rows]
     out = out[:args.n]
@@ -584,12 +680,67 @@ def cmd_find(args):
         print(f'\n打开：python scripts/wb-conv.py show {out[0]["short"]}')
         return
 
-    print(f"标题里没有 {kw!r}。")
+    print(f"标题里没有 {kw!r}。" if data["index"]["status"] == "ok" else f"标题暂不可用，索引{data['index']['status']}。")
     if args.deep:
         print("正文中也没有命中。")
     else:
         print(f"想搜正文加 --deep：")
         print(f"  python scripts/wb-conv.py find {kw} --deep")
+
+
+def timestamp_ms(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            number = float(value)
+            return int(number) if math.isfinite(number) else None
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = naive_local_utc(parsed)
+        return datetime_epoch_ms(parsed)
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None
+
+
+def parse_bound(value):
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = naive_local_utc(parsed)
+        return datetime_epoch_ms(parsed)
+    except (ValueError, TypeError, OverflowError, OSError):
+        raise argparse.ArgumentTypeError(f"无效日期或时间: {value}")
+
+
+def naive_local_utc(value):
+    """Convert local wall time exactly, with a narrow Windows pre-epoch fallback."""
+    try:
+        return value.astimezone(dt.timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        if value.year > 1970:
+            raise
+        # Windows may reject pre-epoch localtime conversions. Its standard local
+        # offset is the only available fallback here; modern dates use the exact
+        # platform timezone rules above, including daylight saving transitions.
+        standard_offset = dt.timedelta(seconds=-time.timezone)
+        return (value - standard_offset).replace(tzinfo=dt.timezone.utc)
+
+
+def datetime_epoch_ms(value):
+    utc_value = value.astimezone(dt.timezone.utc)
+    epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    return int((utc_value - epoch).total_seconds() * 1000)
+
+
+def positive_int(value):
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    if number < 1:
+        raise argparse.ArgumentTypeError("必须是正整数")
+    return number
 
 
 def main():
@@ -603,7 +754,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("list", help="列出最近会话")
-    p.add_argument("-n", type=int, default=20)
+    p.add_argument("-n", type=positive_int, default=20)
     p.add_argument("--cwd", help="按工作目录关键字过滤")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_list)
@@ -611,14 +762,15 @@ def main():
     p = sub.add_parser("find", help="按标题秒查（DB 索引）")
     p.add_argument("keyword")
     p.add_argument("--deep", action="store_true", help="仅标题未命中时下沉搜索正文")
-    p.add_argument("-n", type=int, default=10)
+    p.add_argument("-n", type=positive_int, default=10)
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_find)
 
     p = sub.add_parser("show", help="导出会话正文")
     p.add_argument("id", help="会话 id 或前缀")
     p.add_argument("--full", action="store_true", help="不截断")
-    p.add_argument("--maxlen", type=int, default=1500)
+    p.add_argument("--maxlen", type=positive_int, default=1500)
+    p.add_argument("--tail", type=positive_int, help="只输出最近 N 条消息")
     p.add_argument("--trace", action="store_true", help="附工具调用轨迹")
     p.add_argument("--raw", action="store_true", help="保留用户消息包装原文（自动完整输出）")
     p.add_argument("--out", help="写入文件")
@@ -631,14 +783,31 @@ def main():
 
     p = sub.add_parser("search", help="跨会话搜正文")
     p.add_argument("keyword")
-    p.add_argument("-n", type=int, default=10)
+    p.add_argument("-n", type=positive_int, default=10)
     p.add_argument("--all", action="store_true", help="同时搜索推理与工具事件中的文本")
+    p.add_argument("--since", type=parse_bound, help="起始时间，包含边界")
+    p.add_argument("--before", type=parse_bound, help="结束时间，不包含边界")
+    p.add_argument("--role", choices=("user", "assistant"))
+    p.add_argument("--cwd", help="按索引中的工作目录过滤")
+    p.add_argument("--sort", choices=("relevance", "recent"), default="relevance")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_search)
 
+    for name, handler, help_text in (("locate", cmd_locate, "定位会话 ID 与全部正文文件"),
+                                     ("doctor", cmd_doctor, "诊断索引与 JSONL 对应关系")):
+        p = sub.add_parser(name, help=help_text)
+        if name == "locate":
+            p.add_argument("id", help="会话 id 或前缀")
+        p.add_argument("--json", action="store_true")
+        p.set_defaults(func=handler)
+
     args = ap.parse_args()
+    if args.cmd == "search" and args.since is not None and args.before is not None and args.since >= args.before:
+        ap.error("--since 必须早于 --before")
     set_home(args.home)
-    args.func(args)
+    result = args.func(args)
+    if isinstance(result, int):
+        raise SystemExit(result)
 
 
 if __name__ == "__main__":
